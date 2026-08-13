@@ -31,7 +31,7 @@ DEFAULT_DATA = {
     "settings": {
         "bmr": 1744,
         "step_factor": 0.045,
-        "gemini_model": "gemini-3.1-flash",
+        "gemini_model": "gemini-3.1-flash-lite",
     },
 }
 
@@ -362,7 +362,7 @@ def analyse_food_with_gemini(description):
         )
 
     client = get_gemini_client(api_key)
-    model = data["settings"].get("gemini_model", "gemini-3.1-flash")
+    model = data["settings"].get("gemini_model", "gemini-3.1-flash-lite")
     saved_catalogue = get_saved_food_catalogue()
 
     prompt = f"""
@@ -435,13 +435,13 @@ with st.sidebar.expander("Calculation settings", expanded=False):
     )
     gemini_model = st.text_input(
         "Gemini model",
-        value=data["settings"].get("gemini_model", "gemini-3.1-flash"),
+        value=data["settings"].get("gemini_model", "gemini-3.1-flash-lite"),
     )
 
     if st.button("Save settings", use_container_width=True):
         data["settings"]["bmr"] = int(bmr)
         data["settings"]["step_factor"] = float(step_factor)
-        data["settings"]["gemini_model"] = gemini_model.strip() or "gemini-3.1-flash"
+        data["settings"]["gemini_model"] = gemini_model.strip() or "gemini-3.1-flash-lite"
         save_data()
         st.success("Settings saved.")
 
