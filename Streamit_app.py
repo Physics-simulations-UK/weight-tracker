@@ -30,7 +30,7 @@ DEFAULT_DATA = {
     "saved_foods": [],
     "settings": {
         "bmr": 1744,
-        "step_factor": 0.045,
+        "step_factor": 0.040,
         "gemini_model": "gemini-3.6-flash",
     },
 }
