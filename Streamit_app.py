@@ -30,7 +30,7 @@ DEFAULT_DATA = {
     "saved_foods": [],
     "settings": {
         "bmr": 1744,
-        "step_factor": 0.040,
+        "step_factor": 0.045,
         "gemini_model": "gemini-3.6-flash",
     },
 }
@@ -402,12 +402,8 @@ RULES:
         contents=prompt,
         config={
             "tools": [{"google_search": {}}],
-            "response_format": {
-                "text": {
-                    "mime_type": "application/json",
-                    "schema": FoodAnalysis.model_json_schema(),
-                }
-            },
+            "response_mime_type": "application/json",
+            "response_schema": FoodAnalysis,
         },
     )
 
