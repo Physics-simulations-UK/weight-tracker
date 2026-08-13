@@ -354,6 +354,29 @@ def extract_grounding_sources(response):
     return sources
 
 
+def is_quota_error(exc):
+    message = str(exc)
+    return (
+        "429" in message
+        or "RESOURCE_EXHAUSTED" in message
+        or "quota" in message.lower()
+    )
+
+
+def needs_web_research(result):
+    """
+    Only trigger a second, grounded request when the first pass is genuinely uncertain.
+    Exact user values and saved foods never need web research.
+    """
+    for item in result.items:
+        if (
+            item.source_type == "estimated"
+            and item.confidence in {"medium", "low"}
+        ):
+            return True
+    return False
+
+
 def analyse_food_with_gemini(description):
     api_key = st.secrets.get("GEMINI_API_KEY", "")
     if not api_key:
@@ -365,7 +388,12 @@ def analyse_food_with_gemini(description):
     model = data["settings"].get("gemini_model", "gemini-3.1-flash-lite")
     saved_catalogue = get_saved_food_catalogue()
 
-    prompt = f"""
+    # -----------------------------------------------------
+    # PASS 1 — NO GOOGLE SEARCH
+    # Cheap/fast analysis using supplied values + saved foods
+    # -----------------------------------------------------
+
+    first_prompt = f"""
 You are the nutrition-analysis engine for a personal weight-loss food tracker.
 
 Analyse the user's food description into separate food items and calculate calories
@@ -378,37 +406,118 @@ SAVED FOOD CATALOGUE:
 {json.dumps(saved_catalogue, ensure_ascii=False)}
 
 RULES:
-1. Exact information supplied by the user always wins over estimates.
+1. Exact nutrition information supplied by the user always wins over any estimate.
    Example: "200g hash browns at 159 kcal per 100g" must calculate exactly from 159 kcal/100g.
-2. If an item clearly matches a saved food, use the saved food value rather than estimating it.
-3. When no exact or saved value exists, use Google Search when useful to find a reliable nutrition
-   value, prioritising manufacturers, supermarkets, restaurant nutrition pages, USDA/government
-   databases, or other reputable nutrition sources.
-4. If a branded product is named, actively prefer the manufacturer's or retailer's nutrition data.
-5. If no reliable specific value can be found, make a sensible conservative estimate.
-6. Do not invent false precision. Round calories sensibly and protein to about 0.1 g where useful.
+2. If an item clearly matches a saved food, use the saved-food value.
+3. Do NOT browse or claim to have searched the web in this first pass.
+4. For ordinary generic foods with clear portions, make a sensible conservative estimate.
+5. For branded, restaurant, unusual, or ambiguous foods without exact/saved nutrition:
+   - use source_type "estimated"
+   - use confidence "medium" or "low"
+   - clearly state what information is uncertain in assumption.
+   This signals that the app may perform a second web-research pass.
+6. Do not invent false precision.
 7. If portion size is unclear, state the assumption and reduce confidence.
-8. Calories and protein must correspond to the stated quantity, not per-100g unless the quantity itself is 100g.
+8. Calories and protein must correspond to the quantity actually eaten.
 9. The totals must equal the sum of the returned items.
-10. Use source_type:
-   - user_provided for calculations based on nutrition values in the user's message
-   - saved_food for values taken from the saved catalogue
-   - web_researched when Google Search was used
-   - estimated when neither an exact, saved nor web-specific value was available.
+10. source_type must be one of:
+   - user_provided
+   - saved_food
+   - estimated
+   Do not use web_researched in this first pass.
 """
 
-    response = client.models.generate_content(
-        model=model,
-        contents=prompt,
-        config={
-            "tools": [{"google_search": {}}],
-            "response_mime_type": "application/json",
-            "response_schema": FoodAnalysis,
-        },
-    )
+    try:
+        first_response = client.models.generate_content(
+            model=model,
+            contents=first_prompt,
+            config={
+                "response_mime_type": "application/json",
+                "response_schema": FoodAnalysis,
+            },
+        )
+    except Exception as exc:
+        if is_quota_error(exc):
+            raise RuntimeError(
+                "Gemini quota is currently exhausted for this model/project. "
+                "The tracker did not use Google Search for this request. "
+                "Try again after the quota resets, or check the model/quota in Google AI Studio."
+            ) from exc
+        raise
 
-    result = FoodAnalysis.model_validate_json(response.text)
-    return result, extract_grounding_sources(response)
+    first_result = FoodAnalysis.model_validate_json(first_response.text)
+
+    # If the ordinary analysis is already sufficiently confident, stop here.
+    if not needs_web_research(first_result):
+        return first_result, [], ""
+
+    # -----------------------------------------------------
+    # PASS 2 — GOOGLE SEARCH ONLY WHEN NEEDED
+    # Research branded/uncertain items from pass 1.
+    # If Search quota is unavailable, gracefully keep pass 1.
+    # -----------------------------------------------------
+
+    research_prompt = f"""
+You are refining a nutrition analysis for a personal weight-loss tracker.
+
+ORIGINAL USER DESCRIPTION:
+{description}
+
+SAVED FOOD CATALOGUE:
+{json.dumps(saved_catalogue, ensure_ascii=False)}
+
+FIRST-PASS ANALYSIS:
+{first_result.model_dump_json(indent=2)}
+
+Use Google Search ONLY to improve items that were marked estimated with medium or low confidence.
+
+SEARCH PRIORITY:
+1. Manufacturer nutrition pages.
+2. Supermarket/retailer product nutrition pages.
+3. Restaurant official nutrition pages.
+4. USDA/government or reputable nutrition databases.
+5. Other reputable sources only when the above are unavailable.
+
+RULES:
+1. Preserve exact user-provided values and saved-food values unchanged.
+2. Do not replace a reliable exact value with a generic estimate.
+3. If a reliable specific value is found, set source_type to web_researched.
+4. If research still cannot resolve the item, keep source_type estimated and state the assumption.
+5. Calories/protein must correspond to the user's actual portion.
+6. Totals must equal the sum of all returned items.
+7. Keep conservative estimates where uncertainty remains.
+"""
+
+    try:
+        research_response = client.models.generate_content(
+            model=model,
+            contents=research_prompt,
+            config={
+                "tools": [{"google_search": {}}],
+                "response_mime_type": "application/json",
+                "response_schema": FoodAnalysis,
+            },
+        )
+
+        research_result = FoodAnalysis.model_validate_json(research_response.text)
+        sources = extract_grounding_sources(research_response)
+
+        return research_result, sources, ""
+
+    except Exception as exc:
+        if is_quota_error(exc):
+            warning = (
+                "The basic Gemini analysis succeeded, but Google Search research hit its quota. "
+                "I kept the usable first-pass estimate instead of failing the whole food entry."
+            )
+            return first_result, [], warning
+
+        # A research failure should not destroy a valid first-pass result.
+        warning = (
+            "The basic Gemini analysis succeeded, but the optional web-research pass could not run. "
+            "The first-pass estimate is shown below."
+        )
+        return first_result, [], warning
 
 
 # =========================================================
@@ -831,7 +940,7 @@ with tabs[2]:
 
     st.write(
         "Describe what you ate naturally. Gemini will use exact values you provide, "
-        "your saved foods, and Google Search when useful, then return an editable estimate."
+        "your saved foods, and only use Google Search when the first pass is uncertain, then return an editable estimate."
     )
 
     a1, a2 = st.columns([1, 1])
@@ -852,19 +961,24 @@ with tabs[2]:
             st.warning("Enter a food description first.")
         else:
             try:
-                with st.spinner("Analysing food and checking nutrition values..."):
-                    analysis, sources = analyse_food_with_gemini(food_description)
+                with st.spinner("Analysing food..."):
+                    analysis, sources, research_warning = analyse_food_with_gemini(food_description)
 
                 st.session_state.ai_food_result = analysis.model_dump()
                 st.session_state.ai_food_sources = sources
                 st.session_state.ai_food_day = ai_day.isoformat()
                 st.session_state.ai_food_meal = ai_meal
+                st.session_state.ai_food_research_warning = research_warning
                 st.success("Analysis complete.")
             except Exception as exc:
                 st.error(f"Food analysis failed: {exc}")
 
     if "ai_food_result" in st.session_state:
         result = st.session_state.ai_food_result
+
+        research_warning = st.session_state.get("ai_food_research_warning", "")
+        if research_warning:
+            st.warning(research_warning)
 
         st.markdown("### Review before saving")
         st.caption(
@@ -918,8 +1032,8 @@ with tabs[2]:
                         st.write(src["title"])
         else:
             st.caption(
-                "No Google Search source metadata was returned for this analysis; "
-                "the result may have relied on supplied values, saved foods, or model estimation."
+                "No web sources were needed or available for this analysis. "
+                "The result used supplied values, saved foods, or a conservative Gemini estimate."
             )
 
         remember = st.checkbox(
@@ -952,6 +1066,7 @@ with tabs[2]:
 
             st.success(f"Added to {target_meal}.")
             del st.session_state.ai_food_result
+            st.session_state.pop("ai_food_research_warning", None)
             st.rerun()
 
     if "remember_ai_foods" in st.session_state:
